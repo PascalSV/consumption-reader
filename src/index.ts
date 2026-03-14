@@ -1,6 +1,8 @@
+import { getTimes } from "suncalc";
+
 export interface Env {
     "TASMOTA-READINGS": D1Database;
-    TASMOTA_ANALYTICS_TOKEN?: string;
+    API_KEY?: string;
     TASMOTA_ANALYTICS_IP_ALLOWLIST?: string;
     TASMOTA_ANALYTICS_TIMEZONE?: string;
 }
@@ -32,6 +34,44 @@ interface NightlyStats {
     max: number;
 }
 
+interface NightlyResult {
+    d: string[];
+    k: number[];
+    p: number[];
+    s: NightlyStats;
+    ss: {
+        w: NightlyStats;
+        s: NightlyStats;
+        t: NightlyStats;
+    };
+}
+
+interface LocalDateTimeParts {
+    date: string;
+    hour: number;
+    minute: number;
+    minuteOfDay: number;
+}
+
+interface NightWindowConfig {
+    model: "clock" | "solar";
+    startHour: number;
+    endHour: number;
+    latitude: number | null;
+    longitude: number | null;
+    sunsetOffsetMin: number;
+    sunriseOffsetMin: number;
+    days: number;
+    minPoints: number;
+    maxNights: number;
+    timeZone: string;
+}
+
+interface SolarThreshold {
+    sunsetStartMinute: number;
+    sunriseEndMinute: number;
+}
+
 const ANALYTICS_PATH = "/analytics/nightly";
 const DEFAULT_ANALYTICS_TIMEZONE = "Europe/Berlin";
 
@@ -46,6 +86,10 @@ function methodNotAllowedResponse(): Response {
             Allow: "GET",
         },
     });
+}
+
+function badRequestResponse(message: string): Response {
+    return new Response(message, { status: 400 });
 }
 
 function jsonNoStore(payload: unknown, status = 200): Response {
@@ -119,6 +163,15 @@ function parseIntegerParam(
     return parsed;
 }
 
+function parseFloatParam(value: string | null): number | null {
+    if (!value) {
+        return null;
+    }
+
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
 function parseBearerToken(request: Request): string | null {
     const authHeader = request.headers.get("Authorization");
     if (!authHeader) {
@@ -167,9 +220,9 @@ function isAnalyticsAuthorized(
     env: Env,
     requestContext: RequestLogContext
 ): boolean {
-    const configuredToken = env.TASMOTA_ANALYTICS_TOKEN?.trim();
+    const configuredToken = env.API_KEY?.trim();
     if (!configuredToken) {
-        console.error("Analytics endpoint rejected due to missing config", requestContext);
+        console.error("Analytics endpoint rejected due to missing API_KEY", requestContext);
         return false;
     }
 
@@ -210,39 +263,44 @@ function parseReceivedAtUtc(value: string): Date | null {
     return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-function createLocalDateHourFormatter(timeZone: string): Intl.DateTimeFormat {
+function createLocalDateTimeFormatter(timeZone: string): Intl.DateTimeFormat {
     return new Intl.DateTimeFormat("en-CA", {
         timeZone,
         year: "numeric",
         month: "2-digit",
         day: "2-digit",
         hour: "2-digit",
+        minute: "2-digit",
         hourCycle: "h23",
     });
 }
 
-function getLocalDateHour(
+function getLocalDateTime(
     date: Date,
     formatter: Intl.DateTimeFormat
-): { date: string; hour: number } | null {
+): LocalDateTimeParts | null {
     const parts = formatter.formatToParts(date);
     const year = parts.find((part) => part.type === "year")?.value;
     const month = parts.find((part) => part.type === "month")?.value;
     const day = parts.find((part) => part.type === "day")?.value;
     const hourValue = parts.find((part) => part.type === "hour")?.value;
+    const minuteValue = parts.find((part) => part.type === "minute")?.value;
 
-    if (!year || !month || !day || !hourValue) {
+    if (!year || !month || !day || !hourValue || !minuteValue) {
         return null;
     }
 
     const hour = Number.parseInt(hourValue, 10);
-    if (!Number.isFinite(hour)) {
+    const minute = Number.parseInt(minuteValue, 10);
+    if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
         return null;
     }
 
     return {
         date: `${year}-${month}-${day}`,
         hour,
+        minute,
+        minuteOfDay: hour * 60 + minute,
     };
 }
 
@@ -293,15 +351,203 @@ function computeStats(values: number[]): NightlyStats {
     };
 }
 
+function addDaysIsoDate(dateIso: string, offsetDays: number): string {
+    const year = Number.parseInt(dateIso.slice(0, 4), 10);
+    const month = Number.parseInt(dateIso.slice(5, 7), 10);
+    const day = Number.parseInt(dateIso.slice(8, 10), 10);
+
+    const date = new Date(Date.UTC(year, month - 1, day));
+    date.setUTCDate(date.getUTCDate() + offsetDays);
+    return date.toISOString().slice(0, 10);
+}
+
+function clampMinuteOfDay(value: number): number {
+    if (value < 0) {
+        return 0;
+    }
+
+    if (value > 1439) {
+        return 1439;
+    }
+
+    return value;
+}
+
+function getSeasonKey(dateIso: string): "w" | "s" | "t" {
+    const month = Number.parseInt(dateIso.slice(5, 7), 10);
+
+    if (month === 11 || month === 12 || month === 1 || month === 2) {
+        return "w";
+    }
+
+    if (month >= 5 && month <= 8) {
+        return "s";
+    }
+
+    return "t";
+}
+
+function computeSeasonStats(
+    nightly: Array<[string, NightlyAggregate]>
+): { w: NightlyStats; s: NightlyStats; t: NightlyStats } {
+    const winter: number[] = [];
+    const summer: number[] = [];
+    const transition: number[] = [];
+
+    for (const [dateIso, aggregate] of nightly) {
+        const seasonKey = getSeasonKey(dateIso);
+        if (seasonKey === "w") {
+            winter.push(aggregate.kwh);
+            continue;
+        }
+
+        if (seasonKey === "s") {
+            summer.push(aggregate.kwh);
+            continue;
+        }
+
+        transition.push(aggregate.kwh);
+    }
+
+    return {
+        w: computeStats(winter),
+        s: computeStats(summer),
+        t: computeStats(transition),
+    };
+}
+
+function parseNightWindowConfig(
+    url: URL,
+    timeZone: string
+): NightWindowConfig | string {
+    const modelRaw = url.searchParams.get("model")?.toLowerCase();
+    const model = modelRaw === "solar" ? "solar" : "clock";
+
+    const days = parseIntegerParam(url.searchParams.get("days"), 400, 7, 2000);
+    const minPoints = parseIntegerParam(url.searchParams.get("minPoints"), 3, 1, 96);
+    const maxNights = parseIntegerParam(url.searchParams.get("limit"), 366, 1, 2000);
+
+    const startHour = parseIntegerParam(url.searchParams.get("startHour"), 22, 0, 23);
+    const endHour = parseIntegerParam(url.searchParams.get("endHour"), 6, 0, 23);
+
+    const latitude = parseFloatParam(url.searchParams.get("lat"));
+    const longitude = parseFloatParam(url.searchParams.get("lon"));
+    const sunsetOffsetMin = parseIntegerParam(url.searchParams.get("sunsetOffsetMin"), 0, -180, 180);
+    const sunriseOffsetMin = parseIntegerParam(url.searchParams.get("sunriseOffsetMin"), 0, -180, 180);
+
+    if (model === "solar") {
+        if (latitude === null || longitude === null) {
+            return "For model=solar both lat and lon are required";
+        }
+
+        if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+            return "lat/lon out of range";
+        }
+    }
+
+    return {
+        model,
+        startHour,
+        endHour,
+        latitude,
+        longitude,
+        sunsetOffsetMin,
+        sunriseOffsetMin,
+        days,
+        minPoints,
+        maxNights,
+        timeZone,
+    };
+}
+
+function getNightBucketForClock(local: LocalDateTimeParts, config: NightWindowConfig): string | null {
+    const startMinute = config.startHour * 60;
+    const endMinute = config.endHour * 60;
+
+    if (startMinute === endMinute) {
+        return local.date;
+    }
+
+    if (startMinute < endMinute) {
+        return local.minuteOfDay >= startMinute && local.minuteOfDay < endMinute ? local.date : null;
+    }
+
+    if (local.minuteOfDay >= startMinute) {
+        return local.date;
+    }
+
+    if (local.minuteOfDay < endMinute) {
+        return addDaysIsoDate(local.date, -1);
+    }
+
+    return null;
+}
+
+function getSolarThreshold(
+    dateIso: string,
+    config: NightWindowConfig,
+    formatter: Intl.DateTimeFormat,
+    cache: Map<string, SolarThreshold>
+): SolarThreshold | null {
+    const cached = cache.get(dateIso);
+    if (cached) {
+        return cached;
+    }
+
+    const year = Number.parseInt(dateIso.slice(0, 4), 10);
+    const month = Number.parseInt(dateIso.slice(5, 7), 10);
+    const day = Number.parseInt(dateIso.slice(8, 10), 10);
+
+    const referenceDate = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+    const solarTimes = getTimes(referenceDate, config.latitude ?? 0, config.longitude ?? 0);
+
+    const sunriseLocal = getLocalDateTime(solarTimes.sunrise, formatter);
+    const sunsetLocal = getLocalDateTime(solarTimes.sunset, formatter);
+    if (!sunriseLocal || !sunsetLocal) {
+        return null;
+    }
+
+    const threshold = {
+        sunsetStartMinute: clampMinuteOfDay(sunsetLocal.minuteOfDay + config.sunsetOffsetMin),
+        sunriseEndMinute: clampMinuteOfDay(sunriseLocal.minuteOfDay + config.sunriseOffsetMin),
+    };
+
+    cache.set(dateIso, threshold);
+    return threshold;
+}
+
+function getNightBucketForSolar(
+    local: LocalDateTimeParts,
+    config: NightWindowConfig,
+    formatter: Intl.DateTimeFormat,
+    cache: Map<string, SolarThreshold>
+): string | null {
+    if (config.latitude === null || config.longitude === null) {
+        return null;
+    }
+
+    const threshold = getSolarThreshold(local.date, config, formatter, cache);
+    if (!threshold) {
+        return null;
+    }
+
+    if (local.minuteOfDay >= threshold.sunsetStartMinute) {
+        return local.date;
+    }
+
+    if (local.minuteOfDay < threshold.sunriseEndMinute) {
+        return addDaysIsoDate(local.date, -1);
+    }
+
+    return null;
+}
+
 async function getNightlyAnalytics(
     env: Env,
-    days: number,
-    minPoints: number,
-    maxNights: number,
-    timeZone: string
-): Promise<{ d: string[]; k: number[]; p: number[]; s: NightlyStats }> {
+    config: NightWindowConfig
+): Promise<NightlyResult> {
     const end = new Date();
-    const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
+    const start = new Date(end.getTime() - config.days * 24 * 60 * 60 * 1000);
 
     const queryResult = await env["TASMOTA-READINGS"]
         .prepare(
@@ -314,8 +560,9 @@ async function getNightlyAnalytics(
         .all<ReadingRow>();
 
     const rows = queryResult.results ?? [];
-    const formatter = createLocalDateHourFormatter(timeZone);
+    const formatter = createLocalDateTimeFormatter(config.timeZone);
     const nightlyMap = new Map<string, NightlyAggregate>();
+    const solarCache = new Map<string, SolarThreshold>();
     let previousInput: number | null = null;
 
     for (const row of rows) {
@@ -341,20 +588,15 @@ async function getNightlyAnalytics(
             continue;
         }
 
-        const localDateHour = getLocalDateHour(timestamp, formatter);
-        if (!localDateHour) {
-            continue;
-        }
-
-        const inNightWindow = localDateHour.hour >= 22 || localDateHour.hour < 6;
-        if (!inNightWindow) {
+        const localDateTime = getLocalDateTime(timestamp, formatter);
+        if (!localDateTime) {
             continue;
         }
 
         const bucketDate =
-            localDateHour.hour < 6
-                ? getLocalDateHour(new Date(timestamp.getTime() - 6 * 60 * 60 * 1000), formatter)?.date
-                : localDateHour.date;
+            config.model === "solar"
+                ? getNightBucketForSolar(localDateTime, config, formatter, solarCache)
+                : getNightBucketForClock(localDateTime, config);
 
         if (!bucketDate) {
             continue;
@@ -367,19 +609,27 @@ async function getNightlyAnalytics(
     }
 
     const allNights = Array.from(nightlyMap.entries())
-        .filter(([, aggregate]) => aggregate.points >= minPoints)
+        .filter(([, aggregate]) => aggregate.points >= config.minPoints)
         .sort(([leftDate], [rightDate]) => leftDate.localeCompare(rightDate));
 
-    const selectedNights = allNights.slice(-maxNights);
+    const selectedNights = allNights.slice(-config.maxNights);
     const dates = selectedNights.map(([date]) => date);
     const values = selectedNights.map(([, aggregate]) => roundTo3(aggregate.kwh));
     const points = selectedNights.map(([, aggregate]) => aggregate.points);
+    const roundedNights: Array<[string, NightlyAggregate]> = selectedNights.map(([date, aggregate]) => [
+        date,
+        {
+            kwh: roundTo3(aggregate.kwh),
+            points: aggregate.points,
+        },
+    ]);
 
     return {
         d: dates,
         k: values,
         p: points,
         s: computeStats(values),
+        ss: computeSeasonStats(roundedNights),
     };
 }
 
@@ -389,27 +639,40 @@ async function handleNightlyAnalytics(
     url: URL,
     requestContext: RequestLogContext
 ): Promise<Response> {
-    if (request.method !== "GET") {
-        return methodNotAllowedResponse();
-    }
-
     if (!isAnalyticsAuthorized(request, env, requestContext)) {
         return notFoundResponse();
     }
 
-    const days = parseIntegerParam(url.searchParams.get("days"), 400, 7, 2000);
-    const minPoints = parseIntegerParam(url.searchParams.get("minPoints"), 3, 1, 48);
-    const maxNights = parseIntegerParam(url.searchParams.get("limit"), 366, 1, 2000);
+    if (request.method !== "GET") {
+        return methodNotAllowedResponse();
+    }
+
     const timeZone = resolveAnalyticsTimezone(env);
+    const configOrError = parseNightWindowConfig(url, timeZone);
+    if (typeof configOrError === "string") {
+        return badRequestResponse(configOrError);
+    }
 
     try {
-        const nightly = await getNightlyAnalytics(env, days, minPoints, maxNights, timeZone);
-        return jsonNoStore({
+        const nightly = await getNightlyAnalytics(env, configOrError);
+        const payload: Record<string, unknown> = {
             v: 1,
             tz: timeZone,
-            w: [22, 6],
             ...nightly,
-        });
+            m: configOrError.model,
+        };
+
+        if (configOrError.model === "clock") {
+            payload.w = [configOrError.startHour, configOrError.endHour];
+        } else {
+            payload.sl = {
+                lat: configOrError.latitude,
+                lon: configOrError.longitude,
+                o: [configOrError.sunsetOffsetMin, configOrError.sunriseOffsetMin],
+            };
+        }
+
+        return jsonNoStore(payload);
     } catch (error) {
         console.error("Failed to calculate nightly analytics", {
             ...requestContext,
